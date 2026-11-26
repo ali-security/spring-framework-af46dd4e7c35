@@ -19,7 +19,10 @@ package org.springframework.web.servlet.view.xslt;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.Reader;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.Enumeration;
+import java.util.HexFormat;
 import java.util.Map;
 import java.util.Properties;
 
@@ -45,6 +48,7 @@ import org.w3c.dom.Node;
 import org.springframework.beans.BeansException;
 import org.springframework.context.ApplicationContextException;
 import org.springframework.core.io.Resource;
+import org.springframework.core.log.LogFormatUtils;
 import org.springframework.lang.Nullable;
 import org.springframework.util.Assert;
 import org.springframework.util.CollectionUtils;
@@ -461,17 +465,198 @@ public class XsltView extends AbstractUrlBasedView {
 	protected Source getStylesheetSource() {
 		String url = getUrl();
 		Assert.state(url != null, "'url' not set");
-
 		if (logger.isDebugEnabled()) {
 			logger.debug("Applying stylesheet [" + url + "]");
 		}
+		String location = normalizeInputPath(url);
+		if (shouldIgnoreInputPath(location)) {
+			throw new ApplicationContextException("Invalid XSLT stylesheet location '" + url + "'");
+		}
 		try {
+			// Validated in normalized form above; resolve the configured url as-is
+			// so that accepted locations (e.g. "https://...") load exactly as before.
 			Resource resource = obtainApplicationContext().getResource(url);
 			return new StreamSource(resource.getInputStream(), resource.getURI().toASCIIString());
 		}
 		catch (IOException ex) {
 			throw new ApplicationContextException("Can't load XSLT stylesheet from '" + url + "'", ex);
 		}
+	}
+
+	/**
+	 * Normalize the given resource location, replacing the following:
+	 * <ul>
+	 * <li>Backslash with forward slash.
+	 * <li>Duplicate occurrences of slash with a single slash.
+	 * <li>Any combination of leading slash and control characters (00-1F and 7F)
+	 * with a single "/" or "". For example {@code "  / // foo/bar"}
+	 * becomes {@code "/foo/bar"}.
+	 * </ul>
+	 * <p>Ported from {@code ResourceHandlerUtils}, which does not exist on this branch.
+	 */
+	private static String normalizeInputPath(String path) {
+		path = StringUtils.replace(path, "\\", "/");
+		path = cleanDuplicateSlashes(path);
+		return cleanLeadingSlash(path);
+	}
+
+	private static String cleanDuplicateSlashes(String path) {
+		StringBuilder sb = null;
+		char prev = 0;
+		for (int i = 0; i < path.length(); i++) {
+			char curr = path.charAt(i);
+			try {
+				if ((curr == '/') && (prev == '/')) {
+					if (sb == null) {
+						sb = new StringBuilder(path.substring(0, i));
+					}
+					continue;
+				}
+				if (sb != null) {
+					sb.append(path.charAt(i));
+				}
+			}
+			finally {
+				prev = curr;
+			}
+		}
+		return (sb != null ? sb.toString() : path);
+	}
+
+	private static String cleanLeadingSlash(String path) {
+		boolean slash = false;
+		for (int i = 0; i < path.length(); i++) {
+			if (path.charAt(i) == '/') {
+				slash = true;
+			}
+			else if (path.charAt(i) > ' ' && path.charAt(i) != 127) {
+				if (i == 0 || (i == 1 && slash)) {
+					return path;
+				}
+				return (slash ? "/" + path.substring(i) : path.substring(i));
+			}
+		}
+		return (slash ? "/" : "");
+	}
+
+	/**
+	 * Whether the given stylesheet location must be rejected: blank, or
+	 * escaping upwards via "../" traversal - checked both as given and after
+	 * decoding (once and twice), to catch encoded forms such as "%2e%2e/".
+	 * <p>Stylesheet locations such as "/WEB-INF/xsl/..." or "classpath:..."
+	 * are developer configuration and remain accepted.
+	 * <p>Ported from {@code ResourceHandlerUtils}, which does not exist on this branch.
+	 */
+	private boolean shouldIgnoreInputPath(String path) {
+		return (!StringUtils.hasText(path) || isInvalidPath(path) || isInvalidEncodedPath(path));
+	}
+
+	/**
+	 * Checks for invalid stylesheet locations, rejecting only paths that
+	 * contain "../" (backslashes having already been normalized to "/").
+	 * <p>Unlike {@code ResourceHandlerUtils#isInvalidPath}, locations containing
+	 * "WEB-INF" or "META-INF", or carrying a URL prefix such as "classpath:",
+	 * "file:" or "url:", are not rejected: these are developer-configured
+	 * stylesheet locations (e.g. "/WEB-INF/xsl/products.xsl").
+	 * <p><strong>Note:</strong> this method assumes that leading, duplicate '/'
+	 * or control characters (e.g. white space) have been trimmed so that the
+	 * path starts predictably with a single '/' or does not have one.
+	 * @param path the path to validate
+	 * @return {@code true} if the path is invalid, {@code false} otherwise
+	 */
+	private boolean isInvalidPath(String path) {
+		if (path.contains("../")) {
+			if (logger.isWarnEnabled()) {
+				logger.warn(LogFormatUtils.formatValue(
+						"Stylesheet location contains \"../\": [" + path + "]", -1, true));
+			}
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Check whether the given path contains invalid escape sequences.
+	 * @param path the path to validate
+	 * @return {@code true} if the path is invalid, {@code false} otherwise
+	 */
+	private boolean isInvalidEncodedPath(String path) {
+		String decodedPath = decode(path);
+		if (decodedPath.contains("%")) {
+			decodedPath = decode(decodedPath);
+		}
+		if (!StringUtils.hasText(decodedPath)) {
+			return true;
+		}
+		if (isInvalidPath(decodedPath)) {
+			return true;
+		}
+		decodedPath = normalizeInputPath(decodedPath);
+		return isInvalidPath(decodedPath);
+	}
+
+	private static String decode(String path) {
+		try {
+			return uriDecode(path, StandardCharsets.UTF_8);
+		}
+		catch (Exception ex) {
+			return "";
+		}
+	}
+
+	/**
+	 * Decode the given encoded URI component value by replacing "<i>{@code %xy}</i>"
+	 * sequences by an hexadecimal representation of the character in the specified
+	 * charset, letting other characters unchanged.
+	 * @param source the encoded {@code String}
+	 * @param charset the character encoding to use to decode the "<i>{@code %xy}</i>" sequences
+	 * @return the decoded value
+	 * @throws IllegalArgumentException when the given source contains invalid encoded sequences
+	 */
+	private static String uriDecode(String source, Charset charset) {
+		int length = source.length();
+		int firstPercentIndex = source.indexOf('%');
+		if (length == 0 || firstPercentIndex < 0) {
+			return source;
+		}
+
+		StringBuilder output = new StringBuilder(length);
+		output.append(source, 0, firstPercentIndex);
+		byte[] bytes = null;
+		int i = firstPercentIndex;
+		while (i < length) {
+			char ch = source.charAt(i);
+			if (ch == '%') {
+				try {
+					if (bytes == null) {
+						bytes = new byte[(length - i) / 3];
+					}
+
+					int pos = 0;
+					while (i + 2 < length && ch == '%') {
+						bytes[pos++] = (byte) HexFormat.fromHexDigits(source, i + 1, i + 3);
+						i += 3;
+						if (i < length) {
+							ch = source.charAt(i);
+						}
+					}
+
+					if (i < length && ch == '%') {
+						throw new IllegalArgumentException("Incomplete trailing escape (%) pattern");
+					}
+
+					output.append(new String(bytes, 0, pos, charset));
+				}
+				catch (NumberFormatException ex) {
+					throw new IllegalArgumentException("Invalid encoded sequence \"" + source.substring(i) + "\"");
+				}
+			}
+			else {
+				output.append(ch);
+				i++;
+			}
+		}
+		return output.toString();
 	}
 
 	/**
